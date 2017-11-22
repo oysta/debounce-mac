@@ -17,136 +17,181 @@
 
 typedef CFMachPortRef EventTap;
 
+@interface KeyStroke : NSObject
+
+@property UInt16 keyCode;
+@property NSTimeInterval keyTime;
+
+@end
+
+@implementation KeyStroke
+
+@synthesize keyCode;
+@synthesize keyTime;
+
+@end
+
 @interface KeyChanger : NSObject
 {
 @private
   EventTap _eventTap;
   CFRunLoopSourceRef _runLoopSource;
-  long long lastKeytime;
-  UInt16 lastKeycode;
+  NSMutableArray *keyQueue;
 }
+
+@property NSMutableArray *keyQueue;
+
+- (BOOL)hasBounced:(NSEvent *)event;
+
 @end
 
 CGEventRef _tapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, KeyChanger* listener);
 
 @implementation KeyChanger
 
+@synthesize keyQueue;
+
+- (id)init
+{
+    if (self = [super init]) {
+        self.keyQueue = [NSMutableArray new];
+    }
+    return self;
+}
+
 - (BOOL)tapEvents
 {
-  if (!_eventTap) {
-    NSLog(@"Initializing an event tap.");
-
-    _eventTap = CGEventTapCreate(kCGSessionEventTap,
-                                 kCGTailAppendEventTap,
-                                 kCGEventTapOptionDefault,
-                                 CGEventMaskBit(kCGEventKeyDown),
-                                 (CGEventTapCallBack)_tapCallback,
-                                 (__bridge void *)(self));
     if (!_eventTap) {
-      NSLog(@"Unable to create event tap.  Must run as root or add privlidges for assistive devices to this app.");
-      return NO;
-    }
-  }
-  CGEventTapEnable(_eventTap, TRUE);
+        NSLog(@"Initializing an event tap.");
 
-  return [self isTapActive];
+        _eventTap = CGEventTapCreate(kCGSessionEventTap,
+                                     kCGTailAppendEventTap,
+                                     kCGEventTapOptionDefault,
+                                     CGEventMaskBit(kCGEventKeyDown),
+                                     (CGEventTapCallBack)_tapCallback,
+                                     (__bridge void *)(self));
+        if (!_eventTap) {
+            NSLog(@"Unable to create event tap.  Must run as root or add privileges for assistive devices to this app.");
+            return NO;
+        }
+    }
+    CGEventTapEnable(_eventTap, TRUE);
+
+    return [self isTapActive];
 }
 
 - (BOOL)isTapActive
 {
-  return CGEventTapIsEnabled(_eventTap);
+    return CGEventTapIsEnabled(_eventTap);
 }
 
 - (void)listen
 {
-  if (!_runLoopSource) {
-    if (_eventTap) { // Don't use [self tapActive]
-      _runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault,
-                                                     _eventTap, 0);
-      // Add to the current run loop.
-      CFRunLoopAddSource(CFRunLoopGetCurrent(), _runLoopSource,
-                         kCFRunLoopCommonModes);
+    if (!_runLoopSource) {
+        if (_eventTap) { // Don't use [self tapActive]
+            _runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault,
+                                                           _eventTap, 0);
+            // Add to the current run loop.
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), _runLoopSource,
+                               kCFRunLoopCommonModes);
 
-      NSLog(@"Registering event tap as run loop source.");
-      CFRunLoopRun();
-    }else{
-      NSLog(@"No Event tap in place!  You will need to call listen after tapEvents to get events.");
+            NSLog(@"Registering event tap as run loop source.");
+            CFRunLoopRun();
+        }
+        else {
+            NSLog(@"No Event tap in place!  You will need to call listen after tapEvents to get events.");
+        }
     }
-  }
+}
+
+- (BOOL)hasBounced:(NSEvent *)event
+{
+    NSMutableArray *staleEvents = [NSMutableArray new];
+
+    BOOL bounce = NO;
+
+    for (KeyStroke *previous in self.keyQueue) {
+        NSTimeInterval time = (event.timestamp - previous.keyTime);
+        int64_t timeMs = time * 1000;
+
+        if (timeMs > DEBOUNCE_DELAY) {
+            [staleEvents addObject: previous];
+        }
+        else if (previous.keyCode == event.keyCode) {
+            NSLog(@"BOUNCE detected!!!  Character: %@",
+                  event.characters);
+            NSLog(@"Time between keys: %lldms (limit <%dms)",
+                  timeMs,
+                  DEBOUNCE_DELAY);
+            bounce = YES;
+            break;
+        }
+    }
+
+    [self.keyQueue removeObjectsInArray: staleEvents];
+    return bounce;
 }
 
 - (CGEventRef)processEvent:(CGEventRef)cgEvent
 {
-  NSEvent* event = [NSEvent eventWithCGEvent:cgEvent];
+    NSEvent* event = [NSEvent eventWithCGEvent:cgEvent];
 
-  long long currentKeytime = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
-  UInt16 currentKeycode = [event keyCode];
-  BOOL debounce = NO;
-  long long keyboard_id = CGEventGetIntegerValueField(cgEvent, kCGKeyboardEventKeyboardType);
+    int64_t keyboard_id = CGEventGetIntegerValueField(cgEvent, kCGKeyboardEventKeyboardType);
 
-  if (keyboard_id != SYNTHETIC_KB_ID &&
-      currentKeycode == lastKeycode &&
-      ![event isARepeat] &&
-      (currentKeytime - lastKeytime) < DEBOUNCE_DELAY) {
+    if (keyboard_id == SYNTHETIC_KB_ID || event.isARepeat) {
+        return cgEvent;
+    }
 
-    NSLog(@"BOUNCE detected!!!  Character: %@",
-          event.characters);
-    NSLog(@"Time between keys: %lldms (limit <%dms)",
-          (currentKeytime - lastKeytime),
-          DEBOUNCE_DELAY);
+    if ([self hasBounced: event]) {
+        // Cancel keypress event
+        return NULL;
+    }
 
-    // Cancel keypress event
-    debounce = YES;
-  }
+    KeyStroke *keyStroke = [KeyStroke new];
+    keyStroke.keyCode = event.keyCode;
+    keyStroke.keyTime = event.timestamp;
+    [self.keyQueue addObject: keyStroke];
 
-  if(debounce) {
-    return NULL;
-  }
-
-  lastKeytime = currentKeytime;
-  lastKeycode = currentKeycode;
-
-  return cgEvent;
+    return cgEvent;
 }
 
 - (void)dealloc
 {
-  if (_runLoopSource){
-    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), _runLoopSource, kCFRunLoopCommonModes);
-    CFRelease(_runLoopSource);
-  }
-  if (_eventTap){
-
-    // Kill the event tap
-    CGEventTapEnable(_eventTap, FALSE);
-    CFRelease(_eventTap);
-  }
+    if (_runLoopSource) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), _runLoopSource, kCFRunLoopCommonModes);
+        CFRelease(_runLoopSource);
+    }
+    if (_eventTap) {
+        // Kill the event tap
+        CGEventTapEnable(_eventTap, FALSE);
+        CFRelease(_eventTap);
+    }
 }
 
 @end
 
 CGEventRef _tapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, KeyChanger* listener) {
-  // Do not make the NSEvent here.
-  // NSEvent will throw an exception if we try to make an event from the tap timeout type
-  @autoreleasepool {
-    if(type == kCGEventTapDisabledByTimeout) {
-      NSLog(@"event tap has timed out, re-enabling tap");
-      [listener tapEvents];
-      return nil;
+    // Do not make the NSEvent here.
+    // NSEvent will throw an exception if we try to make an event from the tap timeout type
+    @autoreleasepool {
+        if (type == kCGEventTapDisabledByTimeout) {
+            NSLog(@"event tap has timed out, re-enabling tap");
+            [listener tapEvents];
+            return nil;
+        }
+        if (type != kCGEventTapDisabledByUserInput) {
+            return [listener processEvent:event];
+        }
     }
-    if (type != kCGEventTapDisabledByUserInput) {
-      return [listener processEvent:event];
-    }
-  }
-  return event;
+    return event;
 }
 
 int main(int argc, const char * argv[])
 {
-  @autoreleasepool {
-    KeyChanger* keyChanger = [KeyChanger new];
-    [keyChanger tapEvents];
-    [keyChanger listen]; // This is a blocking call.
-  }
-  return 0;
+    @autoreleasepool {
+        KeyChanger* keyChanger = [KeyChanger new];
+        [keyChanger tapEvents];
+        [keyChanger listen]; // This is a blocking call.
+    }
+    return 0;
 }
