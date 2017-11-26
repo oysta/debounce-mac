@@ -1,6 +1,6 @@
 all: debounce
 
-debounce: debounce.m
-	clang -fobjc-arc -framework Cocoa ./debounce.m -o $@
+debounce: debounce.swift
+	swiftc ./debounce.swift -o $@
 
 .PHONY: all
